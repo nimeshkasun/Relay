@@ -6,7 +6,9 @@ import { ApiKeyRow, AppRow, CatalogService, EntityRow, ModelRow, Snapshot } from
 import { SettingsService } from '../settings/settings.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ipAllowed, SlidingWindowLimiter } from '../auth/security';
-import { adapterFor, AdapterContext, ProviderError, StreamItem } from '../providers/adapters';
+import { adapterFor, AdapterContext, ProviderError, sseEvents, StreamItem } from '../providers/adapters';
+import { AnthropicAdapter } from '../providers/adapters/anthropic.adapter';
+import { anthropicErrorType, messageText, MessagesBody, MessagesStreamRestorer, relayTags, restoreMessage, slotView, textSlots, validateMessages } from './messages';
 import { checkInput, checkOutput, EffectivePolicy, mergePolicies, restorePii, StreamRestorer } from '../guardrails/engine';
 import { PromptsService, renderPrompt } from '../prompts/prompts.controller';
 import { BudgetsService } from './budgets.service';
@@ -44,6 +46,8 @@ interface Prepared {
   logBodies: boolean;
   logRetentionDays: number;
   exposeCost: boolean;
+  /** Set for POST /v1/messages: the Anthropic body sent upstream (after guardrails) and the client's version/beta headers. */
+  native?: { body: MessagesBody; version?: string; betas?: string };
 }
 
 interface Outcome {
@@ -460,6 +464,219 @@ export class GatewayService {
     }
   }
 
+  // ------------------------------------------------------------------ messages (native Anthropic)
+  /**
+   * POST /v1/messages: the Anthropic Messages API, passed through natively to Anthropic
+   * models so thinking blocks, cache_control, server tools, citations and beta features
+   * survive. Keys, rate limits, guardrails, routing, budgets, retries, fallback and
+   * metering work as on /v1/chat/completions; route targets that are not Anthropic
+   * models are skipped. The response cache does not apply.
+   */
+  async messages(kc: KeyContext, body: unknown, req: Request, res: Response): Promise<void> {
+    const release = this.acquire(kc);
+    const abort = new AbortController();
+    const onClose = () => {
+      if (!res.writableEnded) abort.abort();
+    };
+    res.on('close', onClose);
+    try {
+      const p = await this.prepareMessages(kc, body, req);
+      res.setHeader('x-relay-request-id', p.requestId);
+      if (p.resolved.decision) res.setHeader('x-relay-route-decision', p.resolved.decision);
+      if (p.native!.body.stream) await this.runMessagesStream(p, res, abort.signal);
+      else {
+        const r = await this.runMessages(p, abort.signal);
+        res.setHeader('x-relay-model', r.model.slug);
+        res.setHeader('x-relay-cache', 'MISS');
+        if (p.exposeCost) res.setHeader('x-relay-cost-usd', r.costUsd.toFixed(8));
+        res.status(200).json(r.response);
+      }
+    } finally {
+      res.off('close', onClose);
+      release();
+    }
+  }
+
+  private async prepareMessages(kc: KeyContext, body: unknown, httpReq: Request): Promise<Prepared> {
+    const started = Date.now();
+    const requestId = CryptoService.id();
+    const gw = await this.settings.get('gateway');
+    const routing = await this.settings.get('routing');
+    await this.rateLimit(kc, gw.defaultKeyRpm);
+    const snap = await this.catalog.snapshot();
+    const input = validateMessages(body);
+    const tags = relayTags(input, httpReq.headers['x-relay-tags']);
+    const { relay, ...rest } = input;
+    const upstream: MessagesBody = structuredClone(rest);
+    Object.assign(upstream, relay?.providerOptions ?? {});
+    const requestedModel = upstream.model ?? '';
+
+    // Guardrails read (and, when masking PII, rewrite) the text inside the Anthropic blocks.
+    const policies = snap.guardrails.filter((g) => g.isDefault || kc.app.settings?.guardrailPolicyIds?.includes(g.id));
+    const policy = mergePolicies(policies.map((g) => ({ id: g.id, config: g.config })));
+    const slots = textSlots(upstream);
+    const view = slotView(slots);
+    const check = checkInput(view, policy);
+    if (check.blocked) {
+      const err = new GatewayError(400, check.blocked, 'invalid_request_error', 'guardrail_blocked');
+      this.recordBlocked(kc, requestId, started, requestedModel, err, check.flags, !!upstream.stream, 'messages');
+      throw err;
+    }
+    if (check.messages !== view) check.messages.forEach((m, i) => slots[i].set(typeof m.content === 'string' ? m.content : ''));
+    if (policy?.maxOutputTokens) upstream.max_tokens = Math.min(upstream.max_tokens ?? policy.maxOutputTokens, policy.maxOutputTokens);
+    const perReq = kc.key.limits?.maxTokensPerRequest;
+    if (perReq) {
+      const est = estimateMessagesTokens(check.messages) + estimateTokens(JSON.stringify(upstream.tools ?? '')) + (upstream.max_tokens ?? 0);
+      if (est > perReq) throw new GatewayError(400, `Request exceeds this key's limit of ${perReq} tokens per request (estimated ${est})`, 'invalid_request_error', 'request_too_large');
+    }
+
+    const resolved = resolveModel(snap, upstream.model, kc.key, kc.app, 'chat', {
+      messages: check.messages, hasTools: !!upstream.tools?.length, autoThreshold: routing.autoThresholdTokens, autoKeywords: routing.autoStrongKeywords,
+    });
+    resolved.candidates = filterByKey(resolved.candidates, kc.key, resolved.route);
+    if (!resolved.candidates.length) throw new GatewayError(403, 'This key is not allowed to use any model behind this route', 'permission_error', 'model_not_allowed');
+    resolved.candidates = resolved.candidates.filter((m) => snap.providers.get(m.providerId)?.type === 'anthropic');
+    if (!resolved.candidates.length) {
+      throw new GatewayError(400, `"${requestedModel || 'default model'}" has no Anthropic model behind it. /v1/messages serves Anthropic models only; use /v1/chat/completions for other providers.`, 'invalid_request_error', 'model_not_supported');
+    }
+
+    const header = (n: string) => (Array.isArray(httpReq.headers[n]) ? (httpReq.headers[n] as string[]).join(',') : (httpReq.headers[n] as string | undefined));
+    const req: ChatRequest = { model: requestedModel, messages: check.messages, stream: !!upstream.stream, relay: { tags }, user: upstream.metadata?.user_id };
+    return {
+      requestId, started, kc, req, requestedModel, policy, vault: check.vault, flags: check.flags, redactions: check.redactions, resolved, cacheTtl: 0, snap,
+      timeoutMs: gw.requestTimeoutMs, defaultRetries: gw.defaultMaxRetries, logBodies: kc.app.settings?.logBodies ?? gw.storeRequestBodies,
+      logRetentionDays: gw.requestLogRetentionDays, exposeCost: gw.exposeCostHeaders,
+      native: { body: upstream, version: header('anthropic-version'), betas: header('anthropic-beta') },
+    };
+  }
+
+  /**
+   * Tries each candidate with retries, falling back like runChat. `open` either finishes
+   * the request (non-streaming) or opens the upstream stream; failures before the first
+   * byte reaches the client can still fall back.
+   */
+  private async withFallback<T>(p: Prepared, signal: AbortSignal | undefined, open: (model: ModelRow, ctx: AdapterContext, attempts: number) => Promise<T>): Promise<{ value: T; model: ModelRow; attempts: number } | undefined> {
+    let attempts = 0;
+    let lastError: GatewayError | ProviderError | undefined;
+    for (const model of p.resolved.candidates) {
+      const blocked = await this.budgetBlock(p, model);
+      if (blocked) {
+        lastError = blocked;
+        continue;
+      }
+      const provider = p.snap.providers.get(model.providerId)!;
+      const retries = provider.maxRetries ?? p.defaultRetries;
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        attempts++;
+        try {
+          return { value: await open(model, this.adapterCtx(p, model, signal), attempts), model, attempts };
+        } catch (e: any) {
+          if (e instanceof GatewayError) throw e;
+          const err = e instanceof ProviderError ? e : new ProviderError(e?.message ?? 'Unknown error', 502, true);
+          lastError = err;
+          if (err.code === 'client_aborted') {
+            this.finish(p, { model, usage: emptyUsage(), status: 'aborted', httpStatus: 499, attempts, error: err });
+            return undefined;
+          }
+          this.alertProvider(provider.id, provider.name, err);
+          if (err.retryable && attempt < retries) {
+            await sleep(Math.min(8000, 300 * 2 ** attempt) + Math.random() * 200);
+            continue;
+          }
+          if (!this.canFallback(err)) {
+            this.finish(p, { model, usage: emptyUsage(), status: 'error', httpStatus: err.status, attempts, error: err });
+            throw this.toGatewayError(err);
+          }
+          break;
+        }
+      }
+    }
+    const final = lastError ?? new GatewayError(503, 'No model available');
+    this.finish(p, { model: p.resolved.candidates[0], usage: emptyUsage(), status: 'error', httpStatus: this.toGatewayError(final).status, attempts, error: final });
+    throw this.toGatewayError(final);
+  }
+
+  private nativeAdapter(): AnthropicAdapter {
+    return adapterFor('anthropic') as AnthropicAdapter;
+  }
+
+  private async runMessages(p: Prepared, signal: AbortSignal) {
+    const native = p.native!;
+    const r = await this.withFallback(p, signal, async (model, ctx, attempts) => {
+      const res = await this.nativeAdapter().native(ctx, { ...native.body, stream: false }, native);
+      const text = await res.text();
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new ProviderError('Upstream returned invalid JSON', 502, true, 'bad_upstream_response', text.slice(0, 500));
+      }
+      const usage = AnthropicAdapter.usageOf(json.usage);
+      const blockedOut = checkOutput(messageText(json), p.policy);
+      if (blockedOut) {
+        const err = new GatewayError(422, blockedOut, 'invalid_request_error', 'output_blocked');
+        this.finish(p, { model, usage, status: 'blocked', httpStatus: 422, attempts, error: err });
+        throw err;
+      }
+      const response = restoreMessage(json, p.vault);
+      const costUsd = this.finish(p, { model, usage, status: 'success', httpStatus: 200, attempts, response });
+      return { response, costUsd };
+    });
+    if (!r) throw new GatewayError(499, 'Client closed request', 'api_error', 'client_aborted');
+    return { ...r.value, model: r.model };
+  }
+
+  private async runMessagesStream(p: Prepared, res: Response, signal: AbortSignal) {
+    const native = p.native!;
+    const opened = await this.withFallback(p, signal, (_model, ctx) => this.nativeAdapter().native(ctx, { ...native.body, stream: true }, native));
+    if (!opened) return;
+    const { value: upstream, model, attempts } = opened;
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('x-relay-model', model.slug);
+    res.setHeader('x-relay-cache', 'MISS');
+    res.flushHeaders();
+    const ttftMs = Date.now() - p.started;
+    const send = (ev: any) => res.write(`event: ${ev?.type ?? 'message'}\ndata: ${JSON.stringify(ev)}\n\n`);
+    const restorer = new MessagesStreamRestorer(p.vault);
+    let rawUsage: Record<string, unknown> | undefined;
+    let outText = 0;
+    let status: UsageRecord['status'] = 'success';
+    let error: ProviderError | undefined;
+    try {
+      for await (const sse of sseEvents(upstream)) {
+        let ev: any;
+        try {
+          ev = JSON.parse(sse.data);
+        } catch {
+          continue;
+        }
+        if (ev?.type === 'message_start') rawUsage = { ...(ev.message?.usage ?? {}) };
+        else if (ev?.type === 'message_delta' && ev.usage) rawUsage = { ...(rawUsage ?? {}), ...ev.usage };
+        else if (ev?.type === 'content_block_delta') outText += String(ev.delta?.text ?? ev.delta?.thinking ?? ev.delta?.partial_json ?? '').length;
+        else if (ev?.type === 'error') {
+          status = 'error';
+          error = new ProviderError(`Upstream stream error: ${ev.error?.message ?? 'unknown'}`, 502, false, 'upstream_stream_error');
+        }
+        for (const out of restorer.transform(ev)) send(out);
+      }
+    } catch (e: any) {
+      error = e instanceof ProviderError ? e : new ProviderError(e?.message ?? 'Stream failed', 502, false);
+      status = error.code === 'client_aborted' ? 'aborted' : 'error';
+      if (status === 'error' && !res.writableEnded) send({ type: 'error', error: { type: anthropicErrorType(error.status, 'api_error'), message: error.message } });
+    } finally {
+      if (!res.writableEnded) res.end();
+    }
+    let usage = rawUsage ? AnthropicAdapter.usageOf(rawUsage) : emptyUsage();
+    if (!rawUsage || (usage.inputTokens === 0 && usage.outputTokens === 0)) {
+      usage = { ...usage, inputTokens: estimateMessagesTokens(p.req.messages), outputTokens: Math.ceil(outText / 4), estimated: true };
+    }
+    this.finish(p, { model, usage, status, httpStatus: status === 'success' ? 200 : status === 'aborted' ? 499 : 502, attempts, ttftMs, error });
+  }
+
   // ------------------------------------------------------------------ embeddings
   async embeddings(kc: KeyContext, body: any, res: Response) {
     const release = this.acquire(kc);
@@ -601,14 +818,14 @@ export class GatewayService {
   }
 
   private finish(p: Prepared, o: Outcome): number {
-    const cost = this.record(p, 'chat', o);
+    const cost = this.record(p, p.native ? 'messages' : 'chat', o);
     if (p.logBodies && o.status !== 'aborted') {
-      this.recorder.recordBodies(p.requestId, p.kc.app.id, { request: p.req, response: o.response, error: o.error?.message }, p.logRetentionDays);
+      this.recorder.recordBodies(p.requestId, p.kc.app.id, { request: p.native?.body ?? p.req, response: o.response, error: o.error?.message }, p.logRetentionDays);
     }
     return cost;
   }
 
-  private record(p: Prepared, endpoint: 'chat' | 'embeddings', o: Outcome): number {
+  private record(p: Prepared, endpoint: UsageRecord['endpoint'], o: Outcome): number {
     const pricing = o.model?.pricing;
     const cost = o.cacheHit ? { costUsd: 0, inputCostUsd: 0, outputCostUsd: 0 } : computeCost(o.usage, pricing);
     const ctx = { appId: p.kc.app.id, entityId: p.kc.entity.id, keyId: p.kc.key.id, providerId: o.model?.providerId ?? '', modelId: o.model?.id ?? '' };
@@ -627,9 +844,9 @@ export class GatewayService {
     return cost.costUsd;
   }
 
-  private recordBlocked(kc: KeyContext, requestId: string, started: number, requestedModel: string, err: GatewayError, flags: string[], stream: boolean) {
+  private recordBlocked(kc: KeyContext, requestId: string, started: number, requestedModel: string, err: GatewayError, flags: string[], stream: boolean, endpoint: UsageRecord['endpoint'] = 'chat') {
     this.recorder.record({
-      id: requestId, ts: new Date(), requestId, endpoint: 'chat', appId: kc.app.id, entityId: kc.entity.id, keyId: kc.key.id, requestedModel,
+      id: requestId, ts: new Date(), requestId, endpoint, appId: kc.app.id, entityId: kc.entity.id, keyId: kc.key.id, requestedModel,
       status: 'blocked', httpStatus: err.status, errorCode: err.code, errorMessage: err.message, inputTokens: 0, outputTokens: 0, cachedTokens: 0,
       totalTokens: 0, costUsd: 0, inputCostUsd: 0, outputCostUsd: 0, latencyMs: Date.now() - started, cacheHit: false, stream, attempts: 0,
       guardrailFlags: flags, ip: kc.ip,

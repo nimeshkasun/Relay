@@ -173,7 +173,7 @@ export default function Requests() {
             {sel_('providerId', 'Provider', (providers.data ?? []).map((a) => ({ value: a.id, label: a.name })))}
             {sel_('modelId', 'Model', (models.data ?? []).map((a) => ({ value: a.id, label: a.slug })))}
             {sel_('status', 'Status', ['success', 'error', 'blocked', 'aborted'].map((s) => ({ value: s, label: s })))}
-            {sel_('endpoint', 'Endpoint', ['chat', 'embeddings'].map((s) => ({ value: s, label: s })))}
+            {sel_('endpoint', 'Endpoint', ['chat', 'messages', 'embeddings'].map((s) => ({ value: s, label: s })))}
           </div>
         </div>
       </div>

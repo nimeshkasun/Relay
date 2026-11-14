@@ -96,10 +96,7 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   private usage(u: any): Usage {
-    if (!u) return emptyUsage();
-    const cached = u.cache_read_input_tokens ?? 0;
-    const write = u.cache_creation_input_tokens ?? 0;
-    return { inputTokens: (u.input_tokens ?? 0) + cached + write, outputTokens: u.output_tokens ?? 0, cachedTokens: cached, cacheWriteTokens: write };
+    return AnthropicAdapter.usageOf(u);
   }
 
   async chat(ctx: AdapterContext, req: ChatRequest): Promise<ChatResult> {
@@ -195,6 +192,44 @@ export class AnthropicAdapter implements ProviderAdapter {
       }
     }
     yield { usage };
+  }
+
+  /**
+   * Native Messages API passthrough (POST /v1/messages on Relay): the client's body is sent
+   * as-is with the model id swapped, so thinking blocks, cache_control, server tools and
+   * every other Messages feature survive. Client beta flags are merged with the provider's.
+   * Returns the raw upstream response; non-2xx statuses are thrown as ProviderError.
+   */
+  async native(ctx: AdapterContext, body: Record<string, unknown>, client: { version?: string; betas?: string }): Promise<Response> {
+    const headers = this.headers(ctx.provider);
+    if (client.version) headers['anthropic-version'] = client.version;
+    const betas = new Set(
+      [headers['anthropic-beta'], client.betas]
+        .filter(Boolean)
+        .flatMap((s) => String(s).split(','))
+        .map((s) => s.trim())
+        .filter(Boolean),
+    );
+    if (betas.size) headers['anthropic-beta'] = [...betas].join(',');
+    else delete headers['anthropic-beta'];
+    if (body.stream) headers.Accept = 'text/event-stream';
+    const res = await doFetch(`${this.base(ctx.provider)}/v1/messages`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...body, model: ctx.model.providerModelId }),
+      timeoutMs: ctx.timeoutMs,
+      signal: ctx.signal,
+    });
+    if (!res.ok) throw upstreamError(res.status, await res.text());
+    return res;
+  }
+
+  /** Anthropic usage block -> Relay usage (inputTokens includes cache reads and writes). */
+  static usageOf(u: any): Usage {
+    if (!u) return emptyUsage();
+    const cached = u.cache_read_input_tokens ?? 0;
+    const write = u.cache_creation_input_tokens ?? 0;
+    return { inputTokens: (u.input_tokens ?? 0) + cached + write, outputTokens: u.output_tokens ?? 0, cachedTokens: cached, cacheWriteTokens: write };
   }
 
   async listModels(provider: ProviderRuntime, timeoutMs: number): Promise<string[]> {

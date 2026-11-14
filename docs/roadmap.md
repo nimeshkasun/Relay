@@ -27,7 +27,7 @@ Prioritised by value for Axiom, SCIC, Cleo and future projects.
 
 ### Next (high value, low effort)
 1. **SSO for the admin console (Microsoft Entra ID / OIDC)** with group → role mapping; keep local accounts as break-glass.
-2. **Native Anthropic `/v1/messages` and OpenAI Responses API passthrough** so teams can use provider-specific SDK features (prompt caching control, citations, server tools) while still being metered.
+2. **OpenAI Responses API passthrough** so teams can use OpenAI-specific SDK features while still being metered. (Native Anthropic `/v1/messages` is done: see [api.md](api.md#anthropic-messages-api-v1messages).)
 3. **Semantic cache** (embedding similarity with a configurable threshold) for FAQ-style workloads.
 4. **Distributed rate limiting** (Redis or DB counters) for exact cluster-wide RPM/TPM.
 5. **OpenTelemetry traces & Prometheus metrics** (`/metrics`): latency percentiles, TTFT, tokens/sec per model; Azure Monitor integration.

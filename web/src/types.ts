@@ -403,7 +403,7 @@ export interface UsageLog {
   id: string;
   ts: string;
   requestId: string;
-  endpoint: 'chat' | 'embeddings';
+  endpoint: 'chat' | 'embeddings' | 'messages';
   appId: string;
   entityId: string;
   keyId: string;

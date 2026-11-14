@@ -95,6 +95,27 @@ ok(sse.includes('Hello ') && sse.includes('"finish_reason":"stop"'), 'anthropic 
 r = await gw(key, '/v1/chat/completions', { model: 'mock-anthropic/mock-claude', messages: [{ role: 'user', content: 'hello claude' }], relay: { cache: false } });
 ok(r.json.choices?.[0].message.content.startsWith('Hello from mock claude'), 'anthropic non-stream');
 
+// native Anthropic Messages API (/v1/messages)
+const anthHeaders = { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'client-beta-1', 'Content-Type': 'application/json' };
+const messages = (body, extra = {}) => fetch(base + '/v1/messages', { method: 'POST', headers: { ...anthHeaders, ...extra }, body: JSON.stringify(body) });
+const native = { model: 'mock-anthropic/mock-claude', max_tokens: 200, thinking: { type: 'adaptive' }, system: [{ type: 'text', text: 'be nice', cache_control: { type: 'ephemeral' } }] };
+res = await messages({ ...native, messages: [{ role: 'user', content: 'Mail jane.doe@example.com' }], relay: { tags: ['agent:smoke'] } }, { 'x-relay-tags': 'run:1' });
+let j = await res.json();
+ok(res.status === 200 && j.content?.[0]?.type === 'thinking' && j.content[0].signature === 'sig-mock', 'messages: thinking block and signature passed through');
+ok(j._seen?.model === 'mock-claude' && !j._seen.relay && j._seen.beta.includes('client-beta-1') && j._seen.cacheControl, 'messages: model id swapped, relay stripped, beta and cache_control forwarded');
+ok(j._seen?.firstUser.includes('[EMAIL_') && j.content?.[1]?.text.includes('jane.doe@example.com'), 'messages: PII masked upstream and restored in response');
+ok(Number(res.headers.get('x-relay-cost-usd')) > 0 && res.headers.get('x-relay-model') === 'mock-anthropic/mock-claude', 'messages: metered, cost ' + res.headers.get('x-relay-cost-usd'));
+res = await messages({ ...native, stream: true, messages: [{ role: 'user', content: 'Mail jane.doe@example.com' }] });
+sse = await res.text();
+ok(sse.includes('event: message_start') && sse.includes('"thinking_delta"') && sse.includes('"signature":"sig-mock"') && sse.trim().endsWith('data: {"type":"message_stop"}'), 'messages stream: Anthropic events passed through');
+ok(sse.includes('jane.doe@example.com') && !sse.includes('[EMAIL_'), 'messages stream: PII restored in text deltas');
+res = await messages({ model: 'mock-openai/mock-small', max_tokens: 10, messages: [{ role: 'user', content: 'x' }] });
+j = await res.json();
+ok(res.status === 400 && j.type === 'error' && j.error?.type === 'invalid_request_error' && /Anthropic models only/.test(j.error.message), 'messages: non-Anthropic model rejected (Anthropic error shape)');
+res = await messages({ model: 'x', max_tokens: 10, messages: [{ role: 'user', content: 'x' }] }, { 'x-api-key': 'rly_' + 'x'.repeat(43) });
+j = await res.json();
+ok(res.status === 401 && j.type === 'error' && j.error?.type === 'authentication_error', 'messages: invalid key rejected (Anthropic error shape)');
+
 // parallel load
 const t0 = Date.now();
 const many = await Promise.all(Array.from({ length: 200 }, (_, i) => gw(key, '/v1/chat/completions', { model: 'mock-openai/mock-small', messages: [{ role: 'user', content: 'p' + i }], relay: { cache: false } })));

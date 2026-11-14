@@ -114,6 +114,38 @@ Optional, ignored by providers:
 
 `stream: true` returns Server-Sent Events in the OpenAI chunk format for every provider, ending with `data: [DONE]`. Add `stream_options: {"include_usage": true}` to receive a final usage chunk. Relay can fall back to another route target only **before** the first byte is sent; after that an upstream failure is reported as an `error` event in the stream.
 
+## Anthropic Messages API (`/v1/messages`)
+
+For Anthropic models Relay also speaks the native [Messages API](https://docs.anthropic.com/en/api/messages), so the Anthropic SDKs work unchanged. Point them at Relay with a Relay key:
+
+```python
+import anthropic
+client = anthropic.Anthropic(base_url="https://relay.example.com", api_key=os.environ["RELAY_API_KEY"])
+msg = client.messages.create(model="anthropic/claude-opus-5-5", max_tokens=4096, thinking={"type": "adaptive"},
+                             messages=[{"role": "user", "content": "Hello"}])
+```
+
+```ts
+import Anthropic from '@anthropic-ai/sdk';
+const client = new Anthropic({ baseURL: 'https://relay.example.com', apiKey: process.env.RELAY_API_KEY });
+```
+
+The request body is forwarded to Anthropic as sent, with only `model` swapped for the provider's model id. Everything the Messages API supports therefore works: thinking blocks and their signatures, `cache_control` breakpoints and top-level caching, server tools (web search, code execution and the rest), citations, `output_config`, and beta features. Your `anthropic-beta` header is merged with the provider's configured betas, and your `anthropic-version` header is forwarded. Responses and stream events come back exactly as Anthropic sends them.
+
+What still applies, as on `/v1/chat/completions`:
+
+- Keys, rate limits, concurrency limits, IP allowlists and spend caps.
+- Routing and fallback. `model` may be a model slug or a route; route targets that are not Anthropic models are skipped. If nothing Anthropic remains, the request fails with `400` and you should use `/v1/chat/completions`.
+- Guardrails. They read the text in `system`, `text` blocks and `tool_result` blocks. Masked PII is restored in the response's text blocks and client `tool_use` inputs, streamed or not. Thinking blocks are never changed, because their signature covers their content.
+- Metering. Cache reads and cache writes are recorded and priced separately; usage rows show endpoint `messages`.
+- Tags: `relay.tags` in the body (stripped before forwarding), or an `x-relay-tags: a,b` header for SDKs whose types reject extra fields. `relay.providerOptions` is merged into the body.
+
+Differences:
+
+- The response cache is never used. Messages requests usually carry tool loops, thinking or cache breakpoints, where replaying a stored answer is wrong.
+- Managed prompts (`relay.prompt`) are not available.
+- Errors use Anthropic's envelope: `{"type":"error","error":{"type":"rate_limit_error","message":"..."}}`. A reached spend cap is `billing_error`.
+
 ## Embeddings
 
 ```bash
