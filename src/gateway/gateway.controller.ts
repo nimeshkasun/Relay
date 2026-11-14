@@ -19,6 +19,13 @@ export class GatewayController {
     await this.gateway.chat(kc, body, req, res);
   }
 
+  /** Anthropic Messages API (native passthrough to Anthropic models). Anthropic SDKs work with base URL https://<relay-host> and api key rly_... */
+  @Post('messages')
+  async messages(@Req() req: Request, @Res() res: Response, @Body() body: unknown) {
+    const kc = await this.gateway.authenticate(req);
+    await this.gateway.messages(kc, body, req, res);
+  }
+
   @Post('embeddings')
   async embeddings(@Req() req: Request, @Res() res: Response, @Body() body: unknown) {
     const kc = await this.gateway.authenticate(req);

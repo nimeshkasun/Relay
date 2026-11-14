@@ -12,6 +12,28 @@ http
       if (req.url.startsWith('/fail')) { res.statusCode = 503; return res.end(JSON.stringify({ error: { message: 'overloaded' } })); }
       if (req.url.endsWith('/v1/messages')) {
         const text = 'Hello from mock claude. You said: ' + JSON.stringify(j.messages).slice(0, 120);
+        // Native passthrough checks: thinking blocks with signatures, and what the upstream actually received.
+        if (j.thinking) {
+          const seen = { model: j.model, relay: 'relay' in j, beta: req.headers['anthropic-beta'] || '', cacheControl: !!j.system?.[0]?.cache_control, firstUser: JSON.stringify(j.messages?.[0]?.content) };
+          const usage = { input_tokens: 7, output_tokens: 12, cache_read_input_tokens: 40, cache_creation_input_tokens: 3 };
+          if (!j.stream) {
+            res.setHeader('Content-Type', 'application/json');
+            return res.end(JSON.stringify({ id: 'msg_t', type: 'message', role: 'assistant', model: j.model, content: [{ type: 'thinking', thinking: 'mulling', signature: 'sig-mock' }, { type: 'text', text }], stop_reason: 'end_turn', usage, _seen: seen }));
+          }
+          res.setHeader('Content-Type', 'text/event-stream');
+          const ev = (t, d) => res.write(`event: ${t}\ndata: ${JSON.stringify({ type: t, ...d })}\n\n`);
+          ev('message_start', { message: { id: 'msg_t', type: 'message', role: 'assistant', model: j.model, content: [], usage: { input_tokens: 7, cache_read_input_tokens: 40, output_tokens: 1 } } });
+          ev('content_block_start', { index: 0, content_block: { type: 'thinking', thinking: '', signature: '' } });
+          ev('content_block_delta', { index: 0, delta: { type: 'thinking_delta', thinking: 'mulling' } });
+          ev('content_block_delta', { index: 0, delta: { type: 'signature_delta', signature: 'sig-mock' } });
+          ev('content_block_stop', { index: 0 });
+          ev('content_block_start', { index: 1, content_block: { type: 'text', text: '' } });
+          for (const w of text.split(' ')) ev('content_block_delta', { index: 1, delta: { type: 'text_delta', text: w + ' ' } });
+          ev('content_block_stop', { index: 1 });
+          ev('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 12 } });
+          ev('message_stop', {});
+          return res.end();
+        }
         if (j.stream) {
           res.setHeader('Content-Type', 'text/event-stream');
           const ev = (t, d) => res.write(`event: ${t}\ndata: ${JSON.stringify({ type: t, ...d })}\n\n`);

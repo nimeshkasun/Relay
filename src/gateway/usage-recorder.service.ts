@@ -7,7 +7,7 @@ export interface UsageRecord {
   id: string;
   ts: Date;
   requestId: string;
-  endpoint: 'chat' | 'embeddings';
+  endpoint: 'chat' | 'embeddings' | 'messages';
   appId: string;
   entityId: string;
   keyId: string;

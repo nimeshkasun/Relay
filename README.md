@@ -3,6 +3,7 @@
 One secure, OpenAI-compatible API in front of every local and cloud LLM. Applications call Relay instead of providers; Relay handles routing, token and cost metering, spend caps, prompt versioning, caching, PII redaction, guardrails and a tamper-evident audit trail, so each team doesn't have to rebuild these.
 
 - **Providers**: OpenAI, Anthropic, Google Gemini, Azure OpenAI, DeepSeek, Mistral, Groq, xAI, Together, Fireworks, OpenRouter, Perplexity, Cohere, Azure AI Foundry, Bedrock (OpenAI endpoint), Ollama/vLLM/LM Studio, any OpenAI-compatible API, and templated custom HTTP APIs.
+- **APIs**: OpenAI Chat Completions for every provider, plus the native Anthropic Messages API (`/v1/messages`) for Anthropic models, with thinking, prompt caching and server tools intact ([docs/api.md](docs/api.md#anthropic-messages-api-v1messages)).
 - **Keys** per app and entity (developer, environment, service) with access scopes, limits, IP allowlists and immutable expiry; deactivate, reactivate, regenerate or revoke, never delete.
 - **Cost tracking** per app, entity, key, provider and model with editable, versioned pricing; dashboards, reports and CSV export.
 - **Spend caps** on any combination of app / entity / key / provider / model, per day / week / month / lifetime, block or notify.

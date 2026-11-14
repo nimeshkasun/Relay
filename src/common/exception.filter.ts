@@ -1,5 +1,6 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, Logger } from '@nestjs/common';
 import type { Request, Response } from 'express';
+import { anthropicErrorBody } from '../gateway/messages';
 import { GatewayError } from '../gateway/router';
 
 /**
@@ -60,7 +61,11 @@ export class AllExceptionsFilter implements ExceptionFilter {
     }
 
     if (status === 429) res.setHeader('Retry-After', '10');
-    if (isGateway) res.status(status).json({ error: { message, type, code, param: null } });
+    // /v1/messages speaks Anthropic's error envelope so Anthropic SDKs raise the right error class.
+    if (req.path.startsWith('/v1/messages')) {
+      const requestId = res.getHeader('x-relay-request-id');
+      res.status(status).json(anthropicErrorBody(status, type, message, typeof requestId === 'string' ? requestId : undefined));
+    } else if (isGateway) res.status(status).json({ error: { message, type, code, param: null } });
     else res.status(status).json({ statusCode: status, message, code, ...extra });
   }
 }
